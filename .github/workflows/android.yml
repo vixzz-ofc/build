@@ -31,7 +31,7 @@ jobs:
       - name: Download ZIP project
         run: |
           curl -L \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             -o project.zip \
             --connect-timeout 30 \
