@@ -1,0 +1,459 @@
+name: Build Android Studio APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL ZIP project Android Studio'
+        required: true
+      tag:
+        description: 'Tag untuk release'
+        required: true
+      build_type:
+        description: 'Tipe build: debug atau release'
+        required: true
+        default: 'release'
+      press_apk:
+        description: 'Compress APK setelah build (true/false)'
+        required: false
+        default: 'true'
+      pat_token:
+        description: "Token untuk download ZIP"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      # ── Gradle dioptimasi maksimal ──────────────────────────────────────────
+      GRADLE_OPTS: >-
+        -Dorg.gradle.daemon=false
+        -Dorg.gradle.parallel=true
+        -Dorg.gradle.caching=true
+        -Dorg.gradle.jvmargs=-Xmx3g
+        -Dkotlin.incremental=false
+        -Dkotlin.compiler.execution.strategy=in-process
+      JAVA_OPTS: "-Xmx3g -XX:+UseG1GC"
+
+    steps:
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-android-${{ runner.os }}-v2-${{ hashFiles('**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-android-${{ runner.os }}-v2-
+            gradle-android-${{ runner.os }}-
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Install adm-zip
+        run: npm install --prefer-offline adm-zip 2>/dev/null || npm install adm-zip
+
+      # ══════════════════════════════════════════
+      # DOWNLOAD & EXTRACT (digabung untuk speed)
+      # ══════════════════════════════════════════
+      - name: Download & Extract ZIP
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+          INPUT_PAT_TOKEN: ${{ github.event.inputs.pat_token }}
+          SECRET_PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          echo "┌─────────────────────────────────────────┐"
+          echo "│      DOWNLOAD & EXTRACT PROJECT         │"
+          echo "└─────────────────────────────────────────┘"
+
+          START=$(date +%s)
+
+          # Resolve token: input > secret > kosong
+          RESOLVED_TOKEN="${INPUT_PAT_TOKEN:-${SECRET_PAT_TOKEN:-}}"
+
+          HTTP_CODE=$(curl -L -s -o project.zip -w "%{http_code}" \
+            ${RESOLVED_TOKEN:+-H "Authorization: Bearer $RESOLVED_TOKEN"} \
+            -H "Accept: application/octet-stream" \
+            --connect-timeout 15 \
+            --max-time 90 \
+            "$ZIP_URL")
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ]; then
+            echo "  ❌ DOWNLOAD GAGAL — HTTP $HTTP_CODE"
+            echo "  Kemungkinan : Token expired / URL salah / file dihapus"
+            exit 1
+          fi
+
+          if ! unzip -t project.zip > /dev/null 2>&1; then
+            echo "  ❌ FILE BUKAN ZIP VALID"
+            exit 1
+          fi
+
+          echo "  Ukuran : $(du -sh project.zip | cut -f1)  |  Durasi : $(($(date +%s) - START))s"
+
+          unzip -q project.zip -d project_src
+
+          # Deteksi project root dari build.gradle
+          ROOT=$(find project_src -maxdepth 4 \
+            \( -name "build.gradle" -o -name "build.gradle.kts" \) \
+            ! -path "*/app/*" ! -path "*/.gradle/*" \
+            | sort | head -1 | xargs -r dirname 2>/dev/null || echo "")
+
+          if [ -z "$ROOT" ]; then
+            FIRST=$(ls -d project_src/*/ 2>/dev/null | head -1)
+            ROOT="${FIRST:-project_src}"
+          fi
+
+          ROOT="${ROOT%/}"
+          echo "ROOT=$ROOT" >> $GITHUB_ENV
+
+          echo "  Root  : $ROOT  |  Files : $(find "$ROOT" -type f | wc -l)"
+          rm -f project.zip
+          echo "  ✅ Download & extract selesai"
+
+      # ══════════════════════════════════════════
+      # AUTO FIX MODULES
+      # ══════════════════════════════════════════
+      - name: Auto Fix Modules
+        run: |
+          echo "┌─────────────────────────────────────────┐"
+          echo "│           AUTO FIX MODULES              │"
+          echo "└─────────────────────────────────────────┘"
+
+          ROOT_VAL="$ROOT"
+
+          node - "$ROOT_VAL" <<'NODEEOF'
+          const fs=require("fs"),path=require("path");
+          const root=process.argv[2];
+          const sdkDir=process.env.ANDROID_HOME||"/usr/local/lib/android/sdk";
+
+          function read(p){try{return fs.readFileSync(p,"utf8");}catch{return null;}}
+          function write(p,c){try{fs.writeFileSync(p,c,"utf8");}catch(e){console.log(`  ⚠️ Gagal write ${path.basename(p)}: ${e.message}`);}}
+          function cmpVer(a,b){const pa=String(a).split(".").map(Number),pb=String(b).split(".").map(Number);for(let i=0;i<Math.max(pa.length,pb.length);i++){const d=(pa[i]||0)-(pb[i]||0);if(d)return d;}return 0;}
+          function find(dir,name,out=[]){
+            try{for(const e of fs.readdirSync(dir,{withFileTypes:true})){
+              const f=path.join(dir,e.name);
+              if(e.isDirectory()){if(["build",".gradle","node_modules",".git",".dart_tool"].includes(e.name))continue;find(f,name,out);}
+              else if(e.name===name||(Array.isArray(name)&&name.includes(e.name)))out.push(f);
+            }}catch{}return out;
+          }
+
+          const fixes=[];
+
+          // local.properties
+          for(const d of [root,path.join(root,"android")].filter(x=>fs.existsSync(x))){
+            const lp=path.join(d,"local.properties");
+            let c=read(lp)||"";let ch=false;
+            if(!c.includes("sdk.dir")){c+=(c&&!c.endsWith("\n")?"\n":"")+`sdk.dir=${sdkDir}\n`;ch=true;fixes.push(`local.properties: tambah sdk.dir (${path.basename(d)})`);}
+            else{const u=c.replace(/sdk\.dir=.*(\n|$)/g,`sdk.dir=${sdkDir}\n`);if(u!==c){c=u;ch=true;fixes.push(`local.properties: update sdk.dir`);}}
+            if(ch)write(lp,c);
+          }
+
+          // gradle-wrapper
+          for(const fp of find(root,"gradle-wrapper.properties")){
+            let c=read(fp);if(!c)continue;let ch=false;
+            c=c.replace(/distributionUrl=.*(\n|$)/g,m=>{
+              const v=m.match(/gradle-([\d.]+)-/);
+              if(v&&cmpVer(v[1],"8.6")<0){fixes.push(`gradle-wrapper: ${v[1]}→8.6`);ch=true;return"distributionUrl=https\\://services.gradle.org/distributions/gradle-8.6-bin.zip\n";}return m;
+            });
+            if(ch)write(fp,c);
+          }
+
+          // build.gradle root
+          for(const fp of find(root,"build.gradle").filter(f=>!f.includes("/app/"))){
+            let c=read(fp);if(!c)continue;let ch=false;
+            c=c.replace(/classpath\s+['"]com\.android\.tools\.build:gradle:([\d.]+)['"]/g,(m,v)=>{if(cmpVer(v,"8.2.2")<0){fixes.push(`AGP: ${v}→8.2.2`);ch=true;return m.replace(v,"8.2.2");}return m;});
+            c=c.replace(/classpath\s+['"]org\.jetbrains\.kotlin:kotlin-gradle-plugin:([\d.]+)['"]/g,(m,v)=>{if(cmpVer(v,"1.9.22")<0){fixes.push(`Kotlin: ${v}→1.9.22`);ch=true;return m.replace(v,"1.9.22");}return m;});
+            c=c.replace(/ext\.kotlin_version\s*=\s*["']?([\d.]+)["']?/g,(m,v)=>{if(cmpVer(v,"1.9.22")<0){fixes.push(`kotlin_version: ${v}→1.9.22`);ch=true;return m.replace(v,'"1.9.22"');}return m;});
+            if(ch)write(fp,c);
+          }
+
+          // build.gradle app
+          for(const fp of find(root,"build.gradle").filter(f=>f.includes("/app/"))){
+            let c=read(fp);if(!c)continue;let ch=false;
+            [["compileSdk(?:Version)?\\s+(\\d+)",34],["compileSdk\\s*=\\s*(\\d+)",34],
+             ["targetSdk(?:Version)?\\s+(\\d+)",34],["targetSdk\\s*=\\s*(\\d+)",34],
+             ["minSdk(?:Version)?\\s+(\\d+)",21],["minSdk\\s*=\\s*(\\d+)",21]].forEach(([pat,t])=>{
+              c=c.replace(new RegExp(pat,"g"),(m,n)=>{if(parseInt(n)<t){fixes.push(`app ${pat.split("\\s")[0]}: ${n}→${t}`);ch=true;return m.replace(n,String(t));}return m;});
+            });
+            if(ch)write(fp,c);
+          }
+
+          // build.gradle.kts root
+          for(const fp of find(root,"build.gradle.kts").filter(f=>!f.includes("/app/"))){
+            let c=read(fp);if(!c)continue;let ch=false;
+            c=c.replace(/id\("com\.android\.application"\)\s+version\s+"([\d.]+)"/g,(m,v)=>{if(cmpVer(v,"8.2.2")<0){fixes.push(`AGP kts: ${v}→8.2.2`);ch=true;return m.replace(v,"8.2.2");}return m;});
+            c=c.replace(/id\("org\.jetbrains\.kotlin\.android"\)\s+version\s+"([\d.]+)"/g,(m,v)=>{if(cmpVer(v,"1.9.22")<0){fixes.push(`Kotlin kts: ${v}→1.9.22`);ch=true;return m.replace(v,"1.9.22");}return m;});
+            if(ch)write(fp,c);
+          }
+
+          // build.gradle.kts app
+          for(const fp of find(root,"build.gradle.kts").filter(f=>f.includes("/app/"))){
+            let c=read(fp);if(!c)continue;let ch=false;
+            c=c.replace(/compileSdk\s*=\s*(\d+)/g,(m,n)=>{if(parseInt(n)<34){ch=true;fixes.push(`kts compileSdk: ${n}→34`);return m.replace(n,"34");}return m;});
+            c=c.replace(/targetSdk\s*=\s*(\d+)/g,(m,n)=>{if(parseInt(n)<33){ch=true;fixes.push(`kts targetSdk: ${n}→34`);return m.replace(n,"34");}return m;});
+            c=c.replace(/minSdk\s*=\s*(\d+)/g,(m,n)=>{if(parseInt(n)<21){ch=true;fixes.push(`kts minSdk: ${n}→21`);return m.replace(n,"21");}return m;});
+            c=c.replace(/jvmTarget\s*=\s*["'](\d+)["']/g,(m,n)=>{if(parseInt(n)<11){ch=true;fixes.push(`kts jvmTarget: ${n}→17`);return m.replace(n,"17");}return m;});
+            if(ch)write(fp,c);
+          }
+
+          // settings.gradle — pastikan google() ada
+          for(const fp of find(root,["settings.gradle","settings.gradle.kts"])){
+            let c=read(fp);if(!c)continue;let ch=false;
+            if(c.includes("pluginManagement")&&!c.includes("google()")){
+              c=c.replace(/(pluginManagement\s*\{[^}]*repositories\s*\{)([^}]*)\}/s,(m,pre,inner)=>{
+                if(!inner.includes("google()")){fixes.push("settings: tambah google()");ch=true;return `${pre}${inner}        google()\n        }`;}return m;
+              });
+            }
+            if(ch)write(fp,c);
+          }
+
+          console.log(fixes.length===0?"  Tidak ada yang perlu difix ✅":`  Total fix : ${fixes.length}\n${fixes.map(f=>`  ✔  ${f}`).join("\n")}`);
+          NODEEOF
+
+      # ══════════════════════════════════════════
+      # BUILD APK
+      # ══════════════════════════════════════════
+      - name: Build APK
+        id: build_apk
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          echo "┌─────────────────────────────────────────┐"
+          echo "│      BUILD APK  [${BUILD_TYPE^^}]"
+          echo "└─────────────────────────────────────────┘"
+
+          ROOT_VAL="$ROOT"
+          BUILD_LOG=$(mktemp)
+          START=$(date +%s)
+
+          # Cari / generate gradlew
+          GRADLE_PATH=$(find "$ROOT_VAL" -name "gradlew" ! -path "*/.gradle/*" ! -path "*/build/*" | sort | head -1)
+
+          if [ -z "$GRADLE_PATH" ]; then
+            echo "  gradlew : tidak ada — generate otomatis..."
+            ROOT_GRADLE=$(find "$ROOT_VAL" -maxdepth 4 \( -name "build.gradle" -o -name "build.gradle.kts" \) ! -path "*/app/*" ! -path "*/.gradle/*" | sort | head -1)
+
+            if [ -z "$ROOT_GRADLE" ]; then
+              echo "  ❌ build.gradle tidak ditemukan di ZIP"
+              exit 1
+            fi
+
+            GRADLE_DIR=$(dirname "$ROOT_GRADLE")
+            mkdir -p "$GRADLE_DIR/gradle/wrapper"
+            cat > "$GRADLE_DIR/gradle/wrapper/gradle-wrapper.properties" << 'PROPS'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.6-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          PROPS
+            curl -fsSL "https://raw.githubusercontent.com/gradle/gradle/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
+              -o "$GRADLE_DIR/gradle/wrapper/gradle-wrapper.jar" 2>/dev/null \
+            || wget -q "https://raw.githubusercontent.com/gradle/gradle/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
+              -O "$GRADLE_DIR/gradle/wrapper/gradle-wrapper.jar" 2>/dev/null || true
+
+            printf '#!/usr/bin/env sh\nset -e\nAPP_HOME="$(cd "$(dirname "$0")" && pwd -P)"\nexec java -classpath "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" org.gradle.wrapper.GradleWrapperMain "$@"\n' > "$GRADLE_DIR/gradlew"
+            chmod +x "$GRADLE_DIR/gradlew"
+            GRADLE_PATH="$GRADLE_DIR/gradlew"
+            GRADLE_DIR_FINAL="$GRADLE_DIR"
+          else
+            GRADLE_DIR_FINAL=$(dirname "$GRADLE_PATH")
+          fi
+
+          chmod +x "$GRADLE_PATH"
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          echo "sdk.dir=$ANDROID_HOME" > "$GRADLE_DIR_FINAL/local.properties"
+
+          [ "$BUILD_TYPE" = "debug" ] && TASK="assembleDebug" || TASK="assembleRelease"
+          echo "  Task : $TASK  |  Dir : $GRADLE_DIR_FINAL"
+
+          cd "$GRADLE_DIR_FINAL"
+
+          set +e
+          ./gradlew "$TASK" \
+            --no-daemon \
+            --parallel \
+            --build-cache \
+            --configuration-cache-problems=warn \
+            --warning-mode=none \
+            -Pandroid.suppressUnsupportedOptionWarnings=true \
+            -Pandroid.enableJetifier=false \
+            2>&1 | tee "$BUILD_LOG"
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          cd -
+
+          echo "  Durasi : $(($(date +%s) - START))s"
+
+          if [ $BUILD_EXIT -eq 0 ]; then
+            echo "  ✅ BUILD BERHASIL"
+          else
+            echo ""
+            echo "  ❌  BUILD GAGAL"
+            TASK_FAILED=$(grep "FAILED" "$BUILD_LOG" | grep "^> Task" | head -4)
+            WHAT_WRONG=$(awk '/What went wrong:/{found=1;next}found{if(/^$/){exit}print}' "$BUILD_LOG" | head -4)
+            CAUSED_BY=$(awk '/Caused by:/{found=1;next}found{if(/^[[:space:]]*at /||/^$/){exit}print}' "$BUILD_LOG" | head -3)
+            COMPILE_ERR=$(grep -E "^\s*.*\.(java|kt):[0-9]+: error:" "$BUILD_LOG" | head -8)
+
+            [ -n "$TASK_FAILED" ] && echo "  ── Task Gagal ──" && echo "$TASK_FAILED" | sed 's/^/  /'
+            [ -n "$WHAT_WRONG" ] && echo "  ── Penyebab ──" && echo "$WHAT_WRONG" | grep -v "^$" | sed 's/^/  /'
+            [ -n "$CAUSED_BY" ] && echo "  ── Root Cause ──" && echo "$CAUSED_BY" | sed 's/^/  /'
+            [ -n "$COMPILE_ERR" ] && echo "  ── Compile Error ──" && echo "$COMPILE_ERR" | sed 's/^/  /'
+            [ -z "$WHAT_WRONG" ] && [ -z "$CAUSED_BY" ] && [ -z "$COMPILE_ERR" ] && grep -v "^$" "$BUILD_LOG" | tail -12 | sed 's/^/  /'
+
+            rm -f "$BUILD_LOG"
+            exit 1
+          fi
+
+          rm -f "$BUILD_LOG"
+
+      # ══════════════════════════════════════════
+      # FIND APK
+      # ══════════════════════════════════════════
+      - name: Find APK Output
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK=$(find $GITHUB_WORKSPACE -name "*debug*.apk" 2>/dev/null | head -1)
+          else
+            APK=$(find $GITHUB_WORKSPACE -name "*release*.apk" 2>/dev/null | grep -v "unsigned" | head -1)
+            [ -z "$APK" ] && APK=$(find $GITHUB_WORKSPACE -name "*release*.apk" 2>/dev/null | head -1)
+          fi
+          [ -z "$APK" ] && APK=$(find $GITHUB_WORKSPACE -name "*.apk" 2>/dev/null | head -1)
+
+          if [ -z "$APK" ]; then
+            echo "  ❌ APK tidak ditemukan"
+            exit 1
+          fi
+
+          echo "  Nama   : $(basename "$APK")"
+          echo "  Ukuran : $(du -sh "$APK" | cut -f1)"
+          echo "  ✅ APK ditemukan"
+          echo "APK_ABS_PATH=$APK" >> $GITHUB_ENV
+
+      # ══════════════════════════════════════════
+      # PRESS APK
+      # ══════════════════════════════════════════
+      - name: Press APK
+        if: ${{ github.event.inputs.press_apk != 'false' }}
+        run: |
+          echo "┌─────────────────────────────────────────┐"
+          echo "│           PRESS / COMPRESS APK          │"
+          echo "└─────────────────────────────────────────┘"
+
+          APK_PATH="${{ env.APK_ABS_PATH }}"
+          PRESSED_PATH="${APK_PATH%.apk}_pressed.apk"
+
+          node -e "require('adm-zip')" 2>/dev/null || npm install --prefer-offline adm-zip 2>/dev/null || npm install adm-zip
+
+          node - "$APK_PATH" "$PRESSED_PATH" <<'NODEEOF'
+          const fs=require("fs"),zlib=require("zlib");
+          const inputApk=process.argv[2],outputApk=process.argv[3];
+
+          function hasSigning(p){
+            try{const fd=fs.openSync(p,"r"),sz=fs.fstatSync(fd).size,buf=Buffer.alloc(Math.min(65558,sz));
+            fs.readSync(fd,buf,0,buf.length,sz-buf.length);let off=-1;
+            for(let i=buf.length-22;i>=0;i--){if(buf[i]===0x50&&buf[i+1]===0x4b&&buf[i+2]===0x05&&buf[i+3]===0x06){off=i;break;}}
+            if(off<0){fs.closeSync(fd);return false;}const cd=buf.readUInt32LE(off+16);
+            if(cd<24){fs.closeSync(fd);return false;}const magic=Buffer.alloc(16);
+            fs.readSync(fd,magic,0,16,cd-16);fs.closeSync(fd);return magic.toString("utf8")==="APK Sig Block 42";}catch{return false;}
+          }
+
+          const T=new Uint32Array(256);
+          for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=c&1?(0xedb88320^c>>>1):c>>>1;T[i]=c;}
+          function crc32(b){let c=0xffffffff;for(let i=0;i<b.length;i++)c=T[(c^b[i])&0xff]^c>>>8;return(c^0xffffffff)>>>0;}
+
+          const JUNK=[/\.DS_Store$/i,/Thumbs\.db$/i,/^__MACOSX\//,/kotlin-tooling-metadata\.json$/i,/stamp-cert-sha256$/i,/\.tmp$/i,/\.log$/i,/~$/,/\.md$/i,/\.txt$/i,/LICENSE$/i,/NOTICE$/i,/CHANGELOG$/i,/\.map$/i];
+          const PROT=[/^classes[\d]*\.dex$/i,/^AndroidManifest\.xml$/i,/^resources\.arsc$/i,/^lib\//,/^res\//,/^META-INF\//,/libapp\.so$/i,/libflutter\.so$/i,/AssetManifest/i,/FontManifest/i,/flutter_assets\/assets\//i,/flutter_assets\/fonts\//i];
+          const STORE=[/\.png$/i,/\.jpg$/i,/\.jpeg$/i,/\.webp$/i,/\.gif$/i,/\.mp4$/i,/\.mp3$/i,/\.so$/i,/\.dex$/i];
+          function isJunk(n){if(PROT.some(p=>p.test(n)))return false;return JUNK.some(p=>p.test(n));}
+
+          function buildZip(files){
+            const now=new Date(),dt=now.getHours()<<11|now.getMinutes()<<5|Math.floor(now.getSeconds()/2);
+            const dd=(now.getFullYear()-1980)<<9|(now.getMonth()+1)<<5|now.getDate();
+            const lc=[],cd=[],off=[];let pos=0;
+            for(const f of files){
+              const nb=Buffer.from(f.name,"utf8");off.push(pos);
+              const lh=Buffer.allocUnsafe(30+nb.length);
+              lh.writeUInt32LE(0x04034b50,0);lh.writeUInt16LE(20,4);lh.writeUInt16LE(f.m===8?2:0,6);lh.writeUInt16LE(f.m,8);
+              lh.writeUInt16LE(dt,10);lh.writeUInt16LE(dd,12);lh.writeUInt32LE(f.crc,14);lh.writeUInt32LE(f.comp.length,18);
+              lh.writeUInt32LE(f.unc,22);lh.writeUInt16LE(nb.length,26);lh.writeUInt16LE(0,28);nb.copy(lh,30);
+              lc.push(lh,f.comp);pos+=30+nb.length+f.comp.length;
+              const ce=Buffer.allocUnsafe(46+nb.length);
+              ce.writeUInt32LE(0x02014b50,0);ce.writeUInt16LE(20,4);ce.writeUInt16LE(20,6);ce.writeUInt16LE(f.m===8?2:0,8);ce.writeUInt16LE(f.m,10);
+              ce.writeUInt16LE(dt,12);ce.writeUInt16LE(dd,14);ce.writeUInt32LE(f.crc,16);ce.writeUInt32LE(f.comp.length,20);
+              ce.writeUInt32LE(f.unc,24);ce.writeUInt16LE(nb.length,28);ce.writeUInt16LE(0,30);ce.writeUInt16LE(0,32);ce.writeUInt16LE(0,34);
+              ce.writeUInt16LE(0,36);ce.writeUInt32LE(f.m===8?0x20:0,38);ce.writeUInt32LE(off[off.length-1],42);nb.copy(ce,46);cd.push(ce);
+            }
+            const cdb=Buffer.concat(cd),eocd=Buffer.allocUnsafe(22);
+            eocd.writeUInt32LE(0x06054b50,0);eocd.writeUInt16LE(0,4);eocd.writeUInt16LE(0,6);eocd.writeUInt16LE(files.length,8);
+            eocd.writeUInt16LE(files.length,10);eocd.writeUInt32LE(cdb.length,12);eocd.writeUInt32LE(pos,16);eocd.writeUInt16LE(0,20);
+            return Buffer.concat([...lc,cdb,eocd]);
+          }
+
+          const before=fs.statSync(inputApk).size;
+          console.log(`  Input   : ${(before/1024/1024).toFixed(2)} MB`);
+
+          if(hasSigning(inputApk)){
+            console.log("  Info    : APK signed (v2/v3) — skip press");
+            fs.copyFileSync(inputApk,outputApk);console.log("  ✅ Selesai (original)");process.exit(0);
+          }
+
+          let entries;
+          try{
+            const AdmZip=require("adm-zip"),zip=new AdmZip(inputApk);
+            entries=zip.getEntries().filter(e=>!e.isDirectory&&!isJunk(e.entryName)).map(e=>{
+              const raw=e.getData(),ck=crc32(raw),store=STORE.some(p=>p.test(e.entryName));
+              if(store)return{name:e.entryName,comp:raw,m:0,crc:ck,unc:raw.length};
+              try{const def=zlib.deflateRawSync(raw,{level:6,memLevel:9});if(def.length<raw.length)return{name:e.entryName,comp:def,m:8,crc:ck,unc:raw.length};}catch{}
+              return{name:e.entryName,comp:raw,m:0,crc:ck,unc:raw.length};
+            });
+          }catch(e){
+            console.log("  Info    : adm-zip error — pakai original");
+            fs.copyFileSync(inputApk,outputApk);console.log("  ✅ Selesai (original)");process.exit(0);
+          }
+
+          fs.writeFileSync(outputApk,buildZip(entries));
+          const after=fs.statSync(outputApk).size,saved=Math.max(0,before-after);
+          console.log(`  Output  : ${(after/1024/1024).toFixed(2)} MB`);
+          console.log(`  Hemat   : ${(saved/1024/1024).toFixed(2)} MB (${before>0?((saved/before)*100).toFixed(1):0}%)`);
+          console.log("  ✅ Press selesai");
+          NODEEOF
+
+          PRESSED="${{ env.APK_ABS_PATH }}"
+          PRESSED="${PRESSED%.apk}_pressed.apk"
+          [ -f "$PRESSED" ] && echo "APK_ABS_PATH=$PRESSED" >> $GITHUB_ENV || echo "  ⚠️  Pakai APK original"
+
+      # ══════════════════════════════════════════
+      # UPLOAD APK
+      # ══════════════════════════════════════════
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-${{ github.event.inputs.tag }}
+          path: ${{ env.APK_ABS_PATH }}
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
