@@ -48,7 +48,7 @@ jobs:
           node-version: "20"
 
       # =========================
-      # SETUP JAVA (paralel dengan Flutter)
+      # SETUP JAVA
       # =========================
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -94,7 +94,7 @@ jobs:
             android-sdk-${{ runner.os }}-
 
       # =========================
-      # SETUP FLUTTER (dengan cache penuh)
+      # SETUP FLUTTER
       # =========================
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -105,7 +105,7 @@ jobs:
           cache-key: flutter-v2-${{ runner.os }}-3.29.3
 
       # =========================
-      # FLUTTER PRECACHE (agar tidak download saat build)
+      # FLUTTER PRECACHE
       # =========================
       - name: Flutter precache
         run: flutter precache --android --no-ios --no-web --no-linux --no-windows --no-macos
@@ -116,47 +116,63 @@ jobs:
       - name: Download ZIP project
         run: |
           ZIP_URL="${{ github.event.inputs.zip_url }}"
-          echo "📥 Downloading from: $ZIP_URL"
+          echo "📥 URL: $ZIP_URL"
 
-          # Cek apakah URL adalah GitHub Release asset (butuh auth token)
-          if echo "$ZIP_URL" | grep -qi "github.com.*releases/download\|api.github.com"; then
-            echo "🔐 GitHub Release URL detected — pakai PAT_TOKEN"
-            HTTP_CODE=$(curl -fsSL \
+          # Deteksi tipe URL dan set header yang tepat
+          if echo "$ZIP_URL" | grep -q "api.github.com"; then
+            # GitHub API asset URL: https://api.github.com/repos/.../releases/assets/{id}
+            # Harus pakai Accept: application/octet-stream agar return binary bukan JSON
+            echo "🔐 GitHub API asset URL — menggunakan Accept: application/octet-stream"
+            curl -fsSL \
               -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
               -H "Accept: application/octet-stream" \
+              -L \
               "$ZIP_URL" \
               -o project.zip \
               --retry 3 --retry-delay 3 \
               --connect-timeout 30 \
-              --max-time 180 \
-              -w "%{http_code}" 2>&1 || echo "CURL_FAILED")
+              --max-time 180
+          elif echo "$ZIP_URL" | grep -q "github.com.*releases/download"; then
+            # GitHub browser download URL: https://github.com/{owner}/{repo}/releases/download/...
+            echo "🔐 GitHub Release download URL — menggunakan token auth"
+            curl -fsSL \
+              -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+              -H "Accept: application/octet-stream" \
+              -L \
+              "$ZIP_URL" \
+              -o project.zip \
+              --retry 3 --retry-delay 3 \
+              --connect-timeout 30 \
+              --max-time 180
           else
-            echo "🌐 Public URL detected — download tanpa auth"
-            HTTP_CODE=$(curl -fsSL \
+            # Public URL atau URL lain
+            echo "🌐 Public URL — download tanpa auth"
+            curl -fsSL \
+              -L \
               "$ZIP_URL" \
               -o project.zip \
               --retry 3 --retry-delay 3 \
               --connect-timeout 30 \
-              --max-time 180 \
-              -w "%{http_code}" 2>&1 || echo "CURL_FAILED")
+              --max-time 180
           fi
 
-          echo "HTTP Status: $HTTP_CODE"
-
-          # Validasi file terdownload
+          # Validasi hasil download
           if [ ! -f project.zip ] || [ ! -s project.zip ]; then
-            echo "❌ File ZIP tidak ada atau kosong! HTTP: $HTTP_CODE"
-            echo "💡 Kemungkinan penyebab:"
-            echo "   1. URL sudah expired atau tidak valid"
-            echo "   2. GitHub Release asset tidak publik (perlu PAT_TOKEN valid)"
-            echo "   3. PAT_TOKEN expired atau tidak punya scope 'repo'"
+            echo "❌ File ZIP tidak ada atau kosong!"
+            echo "💡 Cek: PAT_TOKEN di GitHub Secrets sudah di-set dan belum expired?"
+            echo "💡 Scope PAT_TOKEN yang dibutuhkan: repo (full)"
             exit 1
           fi
 
+          # Validasi format ZIP
           if ! file project.zip | grep -qi "zip"; then
             echo "❌ File bukan ZIP valid!"
             echo "📄 File type: $(file project.zip)"
-            echo "📄 Content preview: $(head -c 100 project.zip | xxd | head -5)"
+            # Cek apakah isinya HTML error page (token invalid biasanya dapat redirect ke HTML)
+            if file project.zip | grep -qi "html\|text"; then
+              echo "📄 Content: $(head -c 200 project.zip)"
+              echo "💡 Sepertinya download dapat HTML error page — PAT_TOKEN kemungkinan invalid"
+            fi
             exit 1
           fi
 
@@ -208,20 +224,19 @@ jobs:
           exit 1
 
       # =========================
-      # PUB GET (dengan flag optimasi)
+      # PUB GET
       # =========================
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           if [ -f "pubspec.yaml" ]; then
-            # --no-precompile lebih cepat, precompile terjadi lazy saat build
             flutter pub get --no-precompile 2>&1 | tail -10
           else
             echo "⚠️ Bukan Flutter project standar, skip pub get"
           fi
 
       # =========================
-      # BUILD APK (super optimized)
+      # BUILD APK
       # =========================
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
@@ -230,7 +245,6 @@ jobs:
           echo "Mode: $BUILD_TYPE"
 
           if [ -f "pubspec.yaml" ]; then
-            # Flutter build — gunakan semua flag optimasi
             flutter build apk --$BUILD_TYPE \
               --no-pub \
               --suppress-analytics \
@@ -238,12 +252,10 @@ jobs:
               --split-debug-info=/tmp/debug-info \
               2>&1 | grep -v "^Note:" | grep -v "^Downloading" | grep -v "^Running" || true
 
-            # Re-run tanpa filter kalau exit code non-zero
             flutter build apk --$BUILD_TYPE \
               --no-pub \
               --suppress-analytics
           else
-            # Gradle native build
             GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
             if [ -z "$GRADLE_PATH" ]; then
               echo "❌ gradlew tidak ditemukan!"
@@ -287,7 +299,7 @@ jobs:
           echo "APK_PATH=$APK_REL" >> $GITHUB_ENV
 
       # =========================
-      # UPLOAD APK (compression 0 = instant upload)
+      # UPLOAD APK ARTIFACT
       # =========================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
