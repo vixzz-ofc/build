@@ -94,35 +94,16 @@ jobs:
             android-sdk-${{ runner.os }}-
 
       # =========================
-      # SETUP FLUTTER
-      # =========================
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: "3.29.3"
-          channel: "stable"
-          cache: true
-          cache-key: flutter-v2-${{ runner.os }}-3.29.3
-
-      # =========================
-      # FLUTTER PRECACHE
-      # =========================
-      - name: Flutter precache
-        run: flutter precache --android --no-ios --no-web --no-linux --no-windows --no-macos
-
-      # =========================
-      # DOWNLOAD ZIP
+      # DOWNLOAD ZIP (sebelum Flutter setup)
+      # Tujuan: extract pubspec.yaml dulu agar bisa deteksi Flutter version yang dibutuhkan
       # =========================
       - name: Download ZIP project
         run: |
           ZIP_URL="${{ github.event.inputs.zip_url }}"
           echo "📥 URL: $ZIP_URL"
 
-          # Deteksi tipe URL dan set header yang tepat
           if echo "$ZIP_URL" | grep -q "api.github.com"; then
-            # GitHub API asset URL: https://api.github.com/repos/.../releases/assets/{id}
-            # Harus pakai Accept: application/octet-stream agar return binary bukan JSON
-            echo "🔐 GitHub API asset URL — menggunakan Accept: application/octet-stream"
+            echo "🔐 GitHub API asset URL"
             curl -fsSL \
               -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
               -H "Accept: application/octet-stream" \
@@ -133,8 +114,7 @@ jobs:
               --connect-timeout 30 \
               --max-time 180
           elif echo "$ZIP_URL" | grep -q "github.com.*releases/download"; then
-            # GitHub browser download URL: https://github.com/{owner}/{repo}/releases/download/...
-            echo "🔐 GitHub Release download URL — menggunakan token auth"
+            echo "🔐 GitHub Release download URL"
             curl -fsSL \
               -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
               -H "Accept: application/octet-stream" \
@@ -145,10 +125,8 @@ jobs:
               --connect-timeout 30 \
               --max-time 180
           else
-            # Public URL atau URL lain
-            echo "🌐 Public URL — download tanpa auth"
-            curl -fsSL \
-              -L \
+            echo "🌐 Public URL"
+            curl -fsSL -L \
               "$ZIP_URL" \
               -o project.zip \
               --retry 3 --retry-delay 3 \
@@ -156,22 +134,18 @@ jobs:
               --max-time 180
           fi
 
-          # Validasi hasil download
           if [ ! -f project.zip ] || [ ! -s project.zip ]; then
             echo "❌ File ZIP tidak ada atau kosong!"
-            echo "💡 Cek: PAT_TOKEN di GitHub Secrets sudah di-set dan belum expired?"
-            echo "💡 Scope PAT_TOKEN yang dibutuhkan: repo (full)"
+            echo "💡 Cek: PAT_TOKEN di GitHub Secrets sudah di-set dan belum expired (scope: repo)"
             exit 1
           fi
 
-          # Validasi format ZIP
           if ! file project.zip | grep -qi "zip"; then
             echo "❌ File bukan ZIP valid!"
             echo "📄 File type: $(file project.zip)"
-            # Cek apakah isinya HTML error page (token invalid biasanya dapat redirect ke HTML)
             if file project.zip | grep -qi "html\|text"; then
-              echo "📄 Content: $(head -c 200 project.zip)"
-              echo "💡 Sepertinya download dapat HTML error page — PAT_TOKEN kemungkinan invalid"
+              echo "📄 Content: $(head -c 300 project.zip)"
+              echo "💡 Dapat HTML error page — PAT_TOKEN kemungkinan invalid/expired"
             fi
             exit 1
           fi
@@ -197,6 +171,86 @@ jobs:
           echo "✅ Project root: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
           rm -f project.zip
+
+      # =========================
+      # DETECT FLUTTER VERSION dari pubspec.yaml
+      # Baca constraint sdk project, resolve Flutter version yang tepat
+      # =========================
+      - name: Detect Flutter version
+        run: |
+          PUBSPEC_PATH=$(find "$PROJECT_DIR" -name "pubspec.yaml" -maxdepth 3 | head -n 1)
+
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo "⚠️ pubspec.yaml tidak ditemukan, pakai latest stable"
+            echo "FLUTTER_VERSION=" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "📄 Found: $PUBSPEC_PATH"
+
+          # Ambil flutter SDK constraint dari pubspec.yaml
+          # Format: sdk: '>=3.8.1 <4.0.0' atau sdk: ^3.8.1
+          SDK_CONSTRAINT=$(grep -E "^\s+sdk:" "$PUBSPEC_PATH" | head -1 | sed "s/.*sdk:[[:space:]]*//" | tr -d "'\"\n")
+          echo "🔍 SDK constraint: $SDK_CONSTRAINT"
+
+          # Cek apakah ada .flutter-version atau flutter.constraints di pubspec
+          FLUTTER_CONSTRAINT=$(grep -E "^\s+flutter:" "$PUBSPEC_PATH" | grep -v "flutter_lints\|flutter_test" | head -1 | sed "s/.*flutter:[[:space:]]*//" | tr -d "'\"\n" || echo "")
+
+          # Parse minimum Dart version dari constraint
+          # Contoh: '>=3.8.1 <4.0.0' → 3.8.1
+          MIN_DART=$(echo "$SDK_CONSTRAINT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "🎯 Min Dart required: $MIN_DART"
+
+          # Map Dart version → Flutter version
+          # Dart 3.8.x → Flutter 3.32.x (min 3.32.1 untuk Dart 3.8.1)
+          # Dart 3.9.x → Flutter 3.33.x+
+          # Kalau tidak bisa parse → pakai latest stable
+          FLUTTER_VER=""
+
+          if [ -n "$MIN_DART" ]; then
+            DART_MAJOR=$(echo "$MIN_DART" | cut -d. -f1)
+            DART_MINOR=$(echo "$MIN_DART" | cut -d. -f2)
+            DART_PATCH=$(echo "$MIN_DART" | cut -d. -f3)
+
+            if [ "$DART_MAJOR" -eq 3 ] && [ "$DART_MINOR" -le 7 ]; then
+              # Dart <= 3.7.x → Flutter 3.29.x sudah cukup, tapi pakai 3.29.3
+              FLUTTER_VER="3.29.3"
+            elif [ "$DART_MAJOR" -eq 3 ] && [ "$DART_MINOR" -eq 8 ]; then
+              # Dart 3.8.x → butuh Flutter >= 3.32.1
+              # Pakai latest stable (tidak pin) biar selalu dapat yang support
+              FLUTTER_VER=""
+            else
+              # Dart 3.9+ → pakai latest stable
+              FLUTTER_VER=""
+            fi
+          fi
+
+          echo "FLUTTER_VERSION=$FLUTTER_VER" >> $GITHUB_ENV
+
+          if [ -z "$FLUTTER_VER" ]; then
+            echo "✅ Flutter version: latest stable (auto-resolve)"
+          else
+            echo "✅ Flutter version pinned: $FLUTTER_VER"
+          fi
+
+      # =========================
+      # SETUP FLUTTER (version dari deteksi atau latest stable)
+      # =========================
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: "stable"
+          cache: true
+          cache-key: flutter-v3-${{ runner.os }}-${{ env.FLUTTER_VERSION || 'latest' }}
+
+      # =========================
+      # FLUTTER PRECACHE
+      # =========================
+      - name: Flutter precache
+        run: |
+          flutter --version
+          flutter precache --android --no-ios --no-web --no-linux --no-windows --no-macos
 
       # =========================
       # ANALYZE (opsional)
