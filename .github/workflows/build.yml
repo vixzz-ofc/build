@@ -57,17 +57,6 @@ jobs:
           java-version: "17"
 
       # =========================
-      # CACHE PUB PACKAGES
-      # =========================
-      - name: Cache pub packages
-        uses: actions/cache@v4
-        with:
-          path: /opt/pub-cache
-          key: pub-v2-${{ runner.os }}-${{ hashFiles('**/pubspec.yaml') }}
-          restore-keys: |
-            pub-v2-${{ runner.os }}-
-
-      # =========================
       # CACHE GRADLE
       # =========================
       - name: Cache Gradle
@@ -175,6 +164,7 @@ jobs:
       # =========================
       # DETECT FLUTTER VERSION dari pubspec.yaml
       # Baca constraint sdk project, resolve Flutter version yang tepat
+      # Dijalankan SETELAH extract agar pubspec.yaml sudah tersedia
       # =========================
       - name: Detect Flutter version
         run: |
@@ -188,39 +178,25 @@ jobs:
 
           echo "📄 Found: $PUBSPEC_PATH"
 
-          # Ambil flutter SDK constraint dari pubspec.yaml
-          # Format: sdk: '>=3.8.1 <4.0.0' atau sdk: ^3.8.1
-          SDK_CONSTRAINT=$(grep -E "^\s+sdk:" "$PUBSPEC_PATH" | head -1 | sed "s/.*sdk:[[:space:]]*//" | tr -d "'\"\n")
+          SDK_CONSTRAINT=$(grep -E "^\s+sdk:" "$PUBSPEC_PATH" | head -1 | sed "s/.*sdk:[[:space:]]*//" | tr -d "'\"")
           echo "🔍 SDK constraint: $SDK_CONSTRAINT"
 
-          # Cek apakah ada .flutter-version atau flutter.constraints di pubspec
-          FLUTTER_CONSTRAINT=$(grep -E "^\s+flutter:" "$PUBSPEC_PATH" | grep -v "flutter_lints\|flutter_test" | head -1 | sed "s/.*flutter:[[:space:]]*//" | tr -d "'\"\n" || echo "")
-
-          # Parse minimum Dart version dari constraint
-          # Contoh: '>=3.8.1 <4.0.0' → 3.8.1
           MIN_DART=$(echo "$SDK_CONSTRAINT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
           echo "🎯 Min Dart required: $MIN_DART"
 
-          # Map Dart version → Flutter version
-          # Dart 3.8.x → Flutter 3.32.x (min 3.32.1 untuk Dart 3.8.1)
-          # Dart 3.9.x → Flutter 3.33.x+
-          # Kalau tidak bisa parse → pakai latest stable
           FLUTTER_VER=""
 
           if [ -n "$MIN_DART" ]; then
             DART_MAJOR=$(echo "$MIN_DART" | cut -d. -f1)
             DART_MINOR=$(echo "$MIN_DART" | cut -d. -f2)
-            DART_PATCH=$(echo "$MIN_DART" | cut -d. -f3)
 
             if [ "$DART_MAJOR" -eq 3 ] && [ "$DART_MINOR" -le 7 ]; then
-              # Dart <= 3.7.x → Flutter 3.29.x sudah cukup, tapi pakai 3.29.3
               FLUTTER_VER="3.29.3"
             elif [ "$DART_MAJOR" -eq 3 ] && [ "$DART_MINOR" -eq 8 ]; then
-              # Dart 3.8.x → butuh Flutter >= 3.32.1
-              # Pakai latest stable (tidak pin) biar selalu dapat yang support
-              FLUTTER_VER=""
+              # Dart 3.8.x → Flutter 3.32+ → pin ke versi stable yang sudah terbukti
+              FLUTTER_VER="3.32.8"
             else
-              # Dart 3.9+ → pakai latest stable
+              # Dart 3.9+ → latest stable
               FLUTTER_VER=""
             fi
           fi
@@ -234,6 +210,18 @@ jobs:
           fi
 
       # =========================
+      # CACHE PUB PACKAGES
+      # Diletakkan SETELAH extract ZIP agar hashFiles bisa baca pubspec.yaml
+      # =========================
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: /opt/pub-cache
+          key: pub-v2-${{ runner.os }}-${{ hashFiles('**/pubspec.yaml', '**/pubspec.lock') }}
+          restore-keys: |
+            pub-v2-${{ runner.os }}-
+
+      # =========================
       # SETUP FLUTTER (version dari deteksi atau latest stable)
       # =========================
       - name: Setup Flutter
@@ -242,7 +230,7 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: "stable"
           cache: true
-          cache-key: flutter-v3-${{ runner.os }}-${{ env.FLUTTER_VERSION || 'latest' }}
+          cache-key: flutter-v3-${{ runner.os }}-${{ env.FLUTTER_VERSION || 'latest-stable' }}-${{ hashFiles('**/pubspec.yaml') }}
 
       # =========================
       # FLUTTER PRECACHE
@@ -271,11 +259,15 @@ jobs:
             echo "[END_RESULT_ANALYZE]"
           fi
 
+      # =========================
+      # STOP JIKA ONLY ANALYZE
+      # Pakai exit 0 agar workflow tidak dianggap FAILED
+      # =========================
       - name: Stop if Analyze Only
         if: ${{ github.event.inputs.only_analyze == 'true' }}
         run: |
-          echo "Analyze-only mode aktif."
-          exit 1
+          echo "✅ Analyze-only mode selesai."
+          exit 0
 
       # =========================
       # PUB GET
@@ -291,6 +283,7 @@ jobs:
 
       # =========================
       # BUILD APK
+      # Single run — error langsung terlihat, tidak ada silent-fail layer
       # =========================
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
@@ -303,12 +296,7 @@ jobs:
               --no-pub \
               --suppress-analytics \
               --no-tree-shake-icons \
-              --split-debug-info=/tmp/debug-info \
-              2>&1 | grep -v "^Note:" | grep -v "^Downloading" | grep -v "^Running" || true
-
-            flutter build apk --$BUILD_TYPE \
-              --no-pub \
-              --suppress-analytics
+              --split-debug-info=/tmp/debug-info
           else
             GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
             if [ -z "$GRADLE_PATH" ]; then
