@@ -1,0 +1,114 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Android"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      press_apk:
+        description: "Tidak digunakan; APK signed tidak boleh diubah setelah build"
+        required: false
+        default: "false"
+      pat_token:
+        description: "Token untuk download ZIP private"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}-${{ github.event.inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      GRADLE_USER_HOME: ~/.gradle
+      GRADLE_OPTS: "-Dorg.gradle.daemon=true -Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dorg.gradle.workers.max=4 -Dorg.gradle.jvmargs=-Xmx4g"
+
+    steps:
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-gradle-v5-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts') }}
+          restore-keys: |
+            android-gradle-v5-${{ runner.os }}-
+
+      - name: Download and extract project
+        timeout-minutes: 2
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+          INPUT_PAT_TOKEN: ${{ github.event.inputs.pat_token }}
+          SECRET_PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          TOKEN="${INPUT_PAT_TOKEN:-${SECRET_PAT_TOKEN:-}}"
+          AUTH=()
+          if [ -n "$TOKEN" ]; then AUTH=(-H "Authorization: Bearer $TOKEN"); fi
+          curl -fLsS --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 90 \
+            "${AUTH[@]}" -H "Accept: application/octet-stream" "$ZIP_URL" -o project.zip
+          unzip -tq project.zip
+          mkdir project_raw
+          unzip -q project.zip -d project_raw
+          ROOT="project_raw"
+          mapfile -t TOP_DIRS < <(find project_raw -mindepth 1 -maxdepth 1 -type d)
+          TOP_FILES=$(find project_raw -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "${#TOP_DIRS[@]}" -eq 1 ] && [ "$TOP_FILES" -eq 0 ]; then ROOT="${TOP_DIRS[0]}"; fi
+          GRADLEW=$(find "$ROOT" -type f -name gradlew ! -path '*/.gradle/*' ! -path '*/build/*' -print -quit)
+          if [ -z "$GRADLEW" ]; then echo "gradlew tidak ditemukan"; exit 1; fi
+          echo "GRADLEW=$GRADLEW" >> "$GITHUB_ENV"
+          echo "GRADLE_DIR=$(dirname "$GRADLEW")" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        timeout-minutes: 4
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+        run: |
+          set -euo pipefail
+          chmod +x "$GRADLEW"
+          cd "$GRADLE_DIR"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          if [ "$BUILD_TYPE" = "debug" ]; then TASK=assembleDebug; else TASK=assembleRelease; fi
+          timeout 225s ./gradlew "$TASK" --build-cache --parallel --configuration-cache \
+            --no-daemon --max-workers=4 --console=plain -x test -x lint
+
+      - name: Validate APK
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            APK=$(find "$GITHUB_WORKSPACE" -type f -name '*debug*.apk' -print -quit)
+          else
+            APK=$(find "$GITHUB_WORKSPACE" -type f -name '*release*.apk' -print -quit)
+          fi
+          [ -n "$APK" ] || { echo "APK tidak ditemukan"; exit 1; }
+          [ -s "$APK" ] || { echo "APK kosong"; exit 1; }
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
