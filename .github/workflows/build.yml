@@ -1,0 +1,321 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project Flutter"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      only_analyze:
+        description: "Hanya jalankan analyze (true/false)"
+        required: false
+        default: "false"
+      pat_token:
+        description: "Token untuk download ZIP private"
+        required: false
+        default: ""
+
+concurrency:
+  group: flutter-build-${{ github.ref }}-${{ github.event.inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PUB_CACHE: /opt/pub-cache
+      GRADLE_USER_HOME: /opt/gradle-home
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      FLUTTER_CLI_ANALYTICS: "false"
+      FLUTTER_SUPPRESS_ANALYTICS: "true"
+      DART_DISABLE_ANALYTICS: "true"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dorg.gradle.configureondemand=true -Dorg.gradle.workers.max=4 -Dorg.gradle.jvmargs=-Xmx2500m -XX:+UseParallelGC -XX:MaxMetaspaceSize=512m -Dkotlin.incremental=false"
+      JAVA_OPTS: "-Xmx2500m -XX:+UseParallelGC"
+
+    steps:
+
+      # ── JAVA ────────────────────────────────────────────────────────────────────
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # ── CACHE FLUTTER SDK — static key, selalu hit ───────────────────────────
+      - name: Cache Flutter SDK
+        id: flutter-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/flutter
+          key: flutter-sdk-v5-${{ runner.os }}
+          restore-keys: |
+            flutter-sdk-v5-${{ runner.os }}
+
+      # ── CACHE PUB — static key, selalu hit ──────────────────────────────────
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: /opt/pub-cache
+          key: pub-v5-${{ runner.os }}
+          restore-keys: |
+            pub-v5-${{ runner.os }}
+
+      # ── CACHE GRADLE — static key, selalu hit ────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/gradle-home/caches
+            /opt/gradle-home/wrapper
+          key: gradle-flutter-v7-${{ runner.os }}
+          restore-keys: |
+            gradle-flutter-v7-${{ runner.os }}
+
+      # ── SETUP FLUTTER ─────────────────────────────────────────────────────────
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: "stable"
+          cache: true
+          cache-key: flutter-sdk-v5-${{ runner.os }}
+
+      # ── DOWNLOAD & EXTRACT ZIP ────────────────────────────────────────────────
+      - name: Download & Extract ZIP
+        timeout-minutes: 2
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+          INPUT_PAT_TOKEN: ${{ github.event.inputs.pat_token }}
+          SECRET_PAT_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          TOKEN="${INPUT_PAT_TOKEN:-${SECRET_PAT_TOKEN:-}}"
+          AUTH=()
+          [ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
+
+          HTTP_CODE=$(curl -fLsS -o project.zip -w "%{http_code}" \
+            "${AUTH[@]}" \
+            -H "Accept: application/octet-stream" \
+            --connect-timeout 10 --max-time 60 \
+            --retry 2 --retry-delay 1 \
+            "$ZIP_URL")
+
+          [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "302" ] && {
+            echo "❌ DOWNLOAD GAGAL — HTTP $HTTP_CODE"; exit 1; }
+
+          file project.zip | grep -qi "zip" || {
+            echo "❌ Bukan ZIP valid: $(file project.zip)"; exit 1; }
+
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+          rm -f project.zip
+
+          TOP_DIRS=$(find project_raw -mindepth 1 -maxdepth 1 -type d | wc -l)
+          TOP_FILES=$(find project_raw -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$TOP_DIRS" -eq 1 ] && [ "$TOP_FILES" -eq 0 ]; then
+            ROOT=$(find project_raw -mindepth 1 -maxdepth 1 -type d | head -1)
+          else
+            ROOT="project_raw"
+          fi
+          echo "PROJECT_DIR=${ROOT%/}" >> $GITHUB_ENV
+          echo "✅ Extracted: ${ROOT%/}"
+
+      # ── FLUTTER PUB GET ───────────────────────────────────────────────────────
+      - name: Flutter pub get
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          [ -d android ] && echo "sdk.dir=$ANDROID_HOME" > android/local.properties || true
+          flutter pub get --no-precompile 2>&1 | grep -Ev "^Note:|^Resolving|^\s*$" || true
+          flutter pub get --quiet
+          echo "✅ pub get selesai"
+
+      # ── ANALYZE ONLY ──────────────────────────────────────────────────────────
+      - name: Flutter analyze
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos 2>&1 | tail -20
+
+      - name: Stop if Analyze Only
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        run: exit 0
+
+      # ── BUILD APK ─────────────────────────────────────────────────────────────
+      - name: Build APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          START=$(date +%s)
+          cd "$PROJECT_DIR"
+
+          [ -d android ] && echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+          if [ -f "pubspec.yaml" ]; then
+            flutter build apk --$BUILD_TYPE \
+              --no-pub \
+              --suppress-analytics \
+              --no-tree-shake-icons \
+              --split-debug-info=/tmp/debug-info
+          else
+            GRADLE_PATH=$(find . -name "gradlew" ! -path "*/.gradle/*" ! -path "*/build/*" | head -1)
+            [ -z "$GRADLE_PATH" ] && { echo "❌ gradlew tidak ditemukan"; exit 1; }
+            GRADLE_DIR=$(dirname "$GRADLE_PATH")
+            chmod +x "$GRADLE_PATH"
+            echo "sdk.dir=$ANDROID_HOME" > "$GRADLE_DIR/local.properties"
+            cd "$GRADLE_DIR"
+            [ "$BUILD_TYPE" = "debug" ] && TASK="assembleDebug" || TASK="assembleRelease"
+            ./gradlew "$TASK" \
+              --no-daemon --parallel --build-cache --configure-on-demand \
+              --warning-mode=none -x test -x lint --console=plain
+          fi
+
+          echo "✅ BUILD OK — $(( $(date +%s) - START ))s"
+
+      # ── FIND APK ──────────────────────────────────────────────────────────────
+      - name: Find APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        run: |
+          set -euo pipefail
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          FL_DIR="$PROJECT_DIR"
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK=$(find "$FL_DIR/build" -name "*debug*.apk" ! -name "*unsigned*" 2>/dev/null | head -1)
+            [ -z "$APK" ] && APK=$(find "$FL_DIR/build" -name "*debug*.apk" 2>/dev/null | head -1)
+          else
+            APK=$(find "$FL_DIR/build" -name "app-release.apk" 2>/dev/null | head -1)
+            [ -z "$APK" ] && APK=$(find "$FL_DIR/build" -name "*release*.apk" ! -name "*unsigned*" 2>/dev/null | head -1)
+            [ -z "$APK" ] && APK=$(find "$FL_DIR/build" -name "*release*.apk" 2>/dev/null | head -1)
+          fi
+          [ -z "$APK" ] && APK=$(find "$GITHUB_WORKSPACE" -name "*.apk" 2>/dev/null | head -1)
+          [ -z "$APK" ] && { echo "❌ APK tidak ditemukan"; exit 1; }
+
+          APK_ABS=$(realpath "$APK")
+          echo "✅ APK: $(basename $APK_ABS) — $(du -sh $APK_ABS | cut -f1)"
+          echo "APK_ABS_PATH=$APK_ABS" >> $GITHUB_ENV
+
+      # ── PRESS APK — pure node, zero install ───────────────────────────────────
+      - name: Press APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        run: |
+          set -euo pipefail
+          APK_PATH="${{ env.APK_ABS_PATH }}"
+          PRESSED_PATH="${APK_PATH%.apk}_pressed.apk"
+
+          IS_SIGNED=$(node -e "
+            const fs=require('fs');
+            try{
+              const fd=fs.openSync(process.argv[1],'r');
+              const sz=fs.fstatSync(fd).size;
+              const buf=Buffer.alloc(Math.min(65558,sz));
+              fs.readSync(fd,buf,0,buf.length,sz-buf.length);
+              fs.closeSync(fd);
+              let off=-1;
+              for(let i=buf.length-22;i>=0;i--){
+                if(buf[i]===0x50&&buf[i+1]===0x4b&&buf[i+2]===0x05&&buf[i+3]===0x06){off=i;break;}
+              }
+              if(off<0){process.stdout.write('false');process.exit(0);}
+              const cd=buf.readUInt32LE(off+16);
+              if(cd<24){process.stdout.write('false');process.exit(0);}
+              const fd2=fs.openSync(process.argv[1],'r');
+              const magic=Buffer.alloc(16);
+              fs.readSync(fd2,magic,0,16,cd-16);
+              fs.closeSync(fd2);
+              process.stdout.write(magic.toString('utf8')==='APK Sig Block 42'?'true':'false');
+            }catch(e){process.stdout.write('false');}
+          " "$APK_PATH")
+
+          if [ "$IS_SIGNED" = "true" ]; then
+            echo "⚡ APK signed — skip press"
+            echo "APK_ABS_PATH=$APK_PATH" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          node - "$APK_PATH" "$PRESSED_PATH" << 'NODEEOF'
+const fs=require('fs'),zlib=require('zlib');
+const [inp,out]=process.argv.slice(2);
+const T=new Uint32Array(256);
+for(let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=c&1?(0xedb88320^(c>>>1)):(c>>>1);T[i]=c;}
+function crc32(b){let c=0xffffffff;for(let i=0;i<b.length;i++)c=T[(c^b[i])&0xff]^(c>>>8);return(c^0xffffffff)>>>0;}
+const STORE=[/\.png$/i,/\.jpg$/i,/\.jpeg$/i,/\.webp$/i,/\.gif$/i,/\.mp4$/i,/\.mp3$/i,/\.ogg$/i,/\.wav$/i,/\.so$/i,/\.dex$/i,/\.arsc$/i];
+const JUNK=[/\.DS_Store$/i,/Thumbs\.db$/i,/^__MACOSX\//,/\.tmp$/i,/~$/];
+const buf=fs.readFileSync(inp);
+const entries=[];
+let pos=0;
+while(pos<buf.length-4){
+  if(buf.readUInt32LE(pos)!==0x04034b50){pos++;continue;}
+  const fnLen=buf.readUInt16LE(pos+26),extLen=buf.readUInt16LE(pos+28);
+  const name=buf.slice(pos+30,pos+30+fnLen).toString('utf8');
+  const compSz=buf.readUInt32LE(pos+18),uncSz=buf.readUInt32LE(pos+22),method=buf.readUInt16LE(pos+8);
+  const dataStart=pos+30+fnLen+extLen;
+  if(!JUNK.some(p=>p.test(name))){
+    let raw;
+    if(method===8){try{raw=zlib.inflateRawSync(buf.slice(dataStart,dataStart+compSz));}catch(e){raw=buf.slice(dataStart,dataStart+compSz);}}
+    else{raw=buf.slice(dataStart,dataStart+uncSz);}
+    const ck=crc32(raw);
+    if(STORE.some(p=>p.test(name))){entries.push({name,comp:raw,method:0,crc:ck,unc:raw.length});}
+    else{try{const d=zlib.deflateRawSync(raw,{level:6});entries.push(d.length<raw.length?{name,comp:d,method:8,crc:ck,unc:raw.length}:{name,comp:raw,method:0,crc:ck,unc:raw.length});}catch(e){entries.push({name,comp:raw,method:0,crc:ck,unc:raw.length});}}
+  }
+  pos=dataStart+compSz;
+}
+const now=new Date(),dt=(now.getHours()<<11|now.getMinutes()<<5|Math.floor(now.getSeconds()/2)),dd=((now.getFullYear()-1980)<<9|(now.getMonth()+1)<<5|now.getDate());
+const lp=[],cp=[],offsets=[];let p=0;
+for(const f of entries){
+  const nb=Buffer.from(f.name,'utf8');offsets.push(p);
+  const lh=Buffer.allocUnsafe(30+nb.length);
+  lh.writeUInt32LE(0x04034b50,0);lh.writeUInt16LE(20,4);lh.writeUInt16LE(f.method===8?2:0,6);lh.writeUInt16LE(f.method,8);
+  lh.writeUInt16LE(dt,10);lh.writeUInt16LE(dd,12);lh.writeUInt32LE(f.crc,14);lh.writeUInt32LE(f.comp.length,18);
+  lh.writeUInt32LE(f.unc,22);lh.writeUInt16LE(nb.length,26);lh.writeUInt16LE(0,28);nb.copy(lh,30);
+  lp.push(lh,f.comp);p+=30+nb.length+f.comp.length;
+  const ce=Buffer.allocUnsafe(46+nb.length);
+  ce.writeUInt32LE(0x02014b50,0);ce.writeUInt16LE(20,4);ce.writeUInt16LE(20,6);ce.writeUInt16LE(f.method===8?2:0,8);ce.writeUInt16LE(f.method,10);
+  ce.writeUInt16LE(dt,12);ce.writeUInt16LE(dd,14);ce.writeUInt32LE(f.crc,16);ce.writeUInt32LE(f.comp.length,20);
+  ce.writeUInt32LE(f.unc,24);ce.writeUInt16LE(nb.length,28);ce.writeUInt16LE(0,30);ce.writeUInt16LE(0,32);ce.writeUInt16LE(0,34);
+  ce.writeUInt16LE(0,36);ce.writeUInt32LE(f.method===8?0x20:0,38);ce.writeUInt32LE(offsets[offsets.length-1],42);nb.copy(ce,46);
+  cp.push(ce);
+}
+const cdb=Buffer.concat(cp),eocd=Buffer.allocUnsafe(22);
+eocd.writeUInt32LE(0x06054b50,0);eocd.writeUInt16LE(0,4);eocd.writeUInt16LE(0,6);
+eocd.writeUInt16LE(entries.length,8);eocd.writeUInt16LE(entries.length,10);
+eocd.writeUInt32LE(cdb.length,12);eocd.writeUInt32LE(p,16);eocd.writeUInt16LE(0,20);
+const result=Buffer.concat([...lp,cdb,eocd]);
+fs.writeFileSync(out,result);
+const before=fs.statSync(inp).size,after=result.length,saved=Math.max(0,before-after);
+console.log('Input : '+(before/1024/1024).toFixed(2)+' MB');
+console.log('Output: '+(after/1024/1024).toFixed(2)+' MB');
+console.log('Hemat : '+(saved/1024/1024).toFixed(2)+' MB ('+(before>0?((saved/before)*100).toFixed(1):0)+'%)');
+console.log('✅ Press selesai');
+NODEEOF
+
+          if [ -f "$PRESSED_PATH" ] && [ -s "$PRESSED_PATH" ]; then
+            echo "APK_ABS_PATH=$PRESSED_PATH" >> $GITHUB_ENV
+            echo "✅ $(basename $PRESSED_PATH) — $(du -sh $PRESSED_PATH | cut -f1)"
+          else
+            echo "⚠️ Press gagal, pakai original"
+            echo "APK_ABS_PATH=$APK_PATH" >> $GITHUB_ENV
+          fi
+
+      # ── UPLOAD ────────────────────────────────────────────────────────────────
+      - name: Upload APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: ${{ env.APK_ABS_PATH }}
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
